@@ -396,17 +396,35 @@ async function v10WorkerAIDiscuss(){
 }
 
 /* Real AI when Netlify function is configured; honest offline fallback otherwise. */
-let v10AiCode='';const v10Function=v10Config.aiFunction||'/.netlify/functions/yaneai';
-try{v10AiCode=sessionStorage.getItem('YaneCLIBB_AI_code')||''}catch(e){}
-async function v10CheckAI(){if(location.protocol==='file:')return;try{const res=await fetch(v10Function,{method:'GET',cache:'no-store'});if(!res.ok)return;const data=await res.json();v10BackendReady=!!data.configured;if(v10BackendReady){v10Status.textContent='ИИ-сервер доступен. Код доступа вводится при первом запросе. При отправке кадров они будут переданы API-провайдеру.';$('.chathead .pill').textContent='API READY';$('#v10-backend-state').textContent='● ЯнеИИ API доступен';$('#v10-backend-state').classList.add('ready');if(latestReport)$('#v10-ai-analysis').hidden=false}else v10Status.textContent='Настоящий ИИ пока не подключён. Доступны локальные советы и визуальная проверка.'}catch(e){}
+const v10Function=v10Config.aiFunction||'/api/yaneai';
+async function v10CheckAI(){
+ if(location.protocol==='file:')return;
+ try{
+  const res=await fetch(v10Function,{method:'GET',cache:'no-store'});
+  if(!res.ok)return;
+  const data=await res.json();v10BackendReady=!!data.configured;
+  if(v10BackendReady){
+   v10Status.textContent='Настоящий ЯнеИИ доступен всем без пароля. Для защиты от перегрузки действует ограничение запросов. При отправке фото или кадров они передаются API-провайдеру.';
+   $('.chathead .pill').textContent='API READY';
+   $('#v10-backend-state').textContent='● ЯнеИИ открыт для всех';
+   $('#v10-backend-state').classList.add('ready');
+   if(latestReport)$('#v10-ai-analysis').hidden=false;
+  }else v10Status.textContent='Настоящий ИИ пока не подключён. Доступны локальные советы и визуальная проверка.';
+ }catch(e){}
 }
 async function v10RequestAI({mode='chat',message='',frames=[],report=null,history=[]}){
  if(!v10BackendReady)throw Error('ИИ-сервер не настроен.');
- if(!v10AiCode){v10AiCode=prompt('Введи выданный администратором код доступа к ЯнеИИ (не API-ключ):')||'';if(!v10AiCode)throw Error('Код доступа не введён.');try{sessionStorage.setItem('YaneCLIBB_AI_code',v10AiCode)}catch(e){}}
- const request={accessCode:v10AiCode,mode,message,history,frames,report};
+ const request={mode,message,history,frames,report};
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),29000);
- try{const res=await fetch(v10Function,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request),signal:controller.signal});const body=await res.json().catch(()=>({}));if(!res.ok){if(res.status===401){v10AiCode='';try{sessionStorage.removeItem('YaneCLIBB_AI_code')}catch(e){}}throw Error(body.error||'Ошибка '+res.status)}return body}
- finally{clearTimeout(timer)}
+ try{
+  const res=await fetch(v10Function,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request),signal:controller.signal});
+  const body=await res.json().catch(()=>({}));
+  if(!res.ok){
+   if(res.status===429)throw Error('Слишком много запросов. Подожди минуту и попробуй снова.');
+   throw Error(body.error||'Ошибка '+res.status);
+  }
+  return body;
+ }finally{clearTimeout(timer)}
 }
 // Replace v9 canned chat handler: if real AI configured, include conversation context;
 // without server, use clearly labeled local knowledge base without pretending to be generative AI.
