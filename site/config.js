@@ -2,6 +2,6 @@
 window.YANE_CONFIG = {
   supabaseUrl: '',
   supabaseAnonKey: '',
-  aiFunction: '/.netlify/functions/yaneai',
+  aiFunction: '/api/yaneai',
   videoWorkerUrl: '' // e.g. https://YOUR-VIDEO-WORKER.example.com
 };
