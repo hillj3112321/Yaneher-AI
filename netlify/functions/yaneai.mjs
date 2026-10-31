@@ -2,7 +2,7 @@
  * Deploy as netlify/functions/yaneai.mjs (replace old file).
  * Public anonymous version, no access code needed.
  * Netlify environment variable: GEMINI_API_KEY.
- * Optional: GEMINI_MODEL (default gemini-3.8-flash), YANE_AI_PUBLIC_ENABLED=0 to pause access.
+ * Optional: GEMINI_MODEL (default gemini-3.5-flash-lite), YANE_AI_PUBLIC_ENABLED=0 to pause access.
  * Netlify rate-limits requests to the public /api/yaneai endpoint per IP.
  * Do NOT add secrets to source control or site/config.js.
  * The website sends compressed JPEG snapshots, not full video or audio.
@@ -79,7 +79,7 @@ export default async function handler(request){
     parts.push({text:'Кадр на отметке '+Number(frame.time).toFixed(1)+' с:'});
     parts.push({inlineData:{mimeType:'image/jpeg',data:frame.image.slice('data:image/jpeg;base64,'.length)}});
   }
-  const model=process.env.GEMINI_MODEL||'gemini-3.8-flash';
+  const model=(process.env.GEMINI_MODEL||'gemini-3.5-flash-lite').trim();
   // Restrict model value to avoid server-side URL injection via configuration.
   if(!/^gemini-[a-zA-Z0-9.\-]+$/.test(model))return fail('Некорректное имя модели',503);
 
@@ -92,15 +92,23 @@ export default async function handler(request){
       body:JSON.stringify({
         systemInstruction:{parts:[{text:instructions}]},
         contents:[...history,{role:'user',parts}],
-        generationConfig:{maxOutputTokens:4096,temperature:0.6}
+        generationConfig:{maxOutputTokens:4096}
       })
     });
     const data=await response.json().catch(()=>({}));
     if(!response.ok){
-      if(response.status===429)return fail('Исчерпан бесплатный лимит Gemini. Проверь квоту в Google AI Studio и попробуй позже.',429);
-      if(response.status===400||response.status===404)return fail('Модель Gemini недоступна для этого ключа. Проверь GEMINI_MODEL (например gemini-3.8-flash).',502);
-      if(response.status===401||response.status===403)return fail('Google отклонил API-ключ. Проверь GEMINI_API_KEY и доступ к модели.',502);
-      return fail('Gemini временно недоступен (HTTP '+response.status+').',502);
+      // Preserve Google's diagnostic category instead of calling every 400 a model error.
+      // Scrub the API key and Google-style keys before returning any provider detail.
+      const raw=String(data?.error?.message||data?.message||'Без дополнительных деталей.');
+      const detail=raw.split(key).join('[ключ скрыт]')
+        .replace(/AIza[0-9A-Za-z_-]{16,}/g,'[ключ скрыт]')
+        .replace(/([?&]key=)[^&\s]+/gi,'$1[ключ скрыт]')
+        .replace(/[\r\n\t]+/g,' ').slice(0,550);
+      if(response.status===429)return fail('Gemini: исчерпан лимит запросов/квота (HTTP 429). '+detail,429);
+      if(response.status===400)return fail('Gemini отклонил формат запроса или настройки (HTTP 400): '+detail,502);
+      if(response.status===404)return fail('Gemini не нашёл модель «'+model+'» для generateContent (HTTP 404): '+detail,502);
+      if(response.status===401||response.status===403)return fail('Gemini запретил доступ (HTTP '+response.status+'): '+detail,502);
+      return fail('Gemini вернул HTTP '+response.status+': '+detail,502);
     }
     const answer=(data.candidates||[]).flatMap(c=>(c.content?.parts||[])
       .filter(p=>typeof p.text==='string').map(p=>p.text)).join('\n').trim();
