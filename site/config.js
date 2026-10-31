@@ -1,7 +1,7 @@
-/* Public, non-secret configuration. Only SUPABASE ANON key belongs here. */
+/* Public browser configuration. Do not put service_role, sb_secret, or Gemini API keys here. */
 window.YANE_CONFIG = {
-  supabaseUrl: '',
-  supabaseAnonKey: '',
+  supabaseUrl: 'https://jmbznhnlutfxuthtkdky.supabase.co',
+  supabaseAnonKey: 'sb_publishable_Z07KzrDN2XP33cOFUp6Y-w_6h0V_3kP',
   aiFunction: '/api/yaneai',
-  videoWorkerUrl: '' // e.g. https://YOUR-VIDEO-WORKER.example.com
+  videoWorkerUrl: '' // Add an HTTPS video-worker URL only after deployment.
 };

@@ -1,8 +1,8 @@
 /** YaneAI + Gemini API for the existing Yaneher Chat v10 frontend.
  * Deploy as netlify/functions/yaneai.mjs (replace old file).
- * Public anonymous version, no access code needed.
+ * v11 authenticated version: Supabase Auth required, server-side 60s cooldown.
  * Netlify environment variable: GEMINI_API_KEY.
- * Optional: GEMINI_MODEL (default gemini-3.5-flash-lite), YANE_AI_PUBLIC_ENABLED=0 to pause access.
+ * Required: GEMINI_API_KEY, GEMINI_MODEL, SUPABASE_URL, SUPABASE_ANON_KEY.
  * Netlify rate-limits requests to the public /api/yaneai endpoint per IP.
  * Do NOT add secrets to source control or site/config.js.
  * The website sends compressed JPEG snapshots, not full video or audio.
@@ -38,13 +38,28 @@ Premiere Pro, DaVinci Resolve, видеомонтаж, звук, субтитр�
 
 export default async function handler(request){
   if(request.method==='GET')return json({
-    configured:Boolean(process.env.GEMINI_API_KEY&&process.env.YANE_AI_PUBLIC_ENABLED!=='0'),
-    mode:'public-rate-limited',publicAccess:true,provider:'Gemini'
+    configured:Boolean(process.env.GEMINI_API_KEY&&process.env.SUPABASE_URL&&process.env.SUPABASE_ANON_KEY),
+    mode:'authenticated-60s',publicAccess:false,provider:'Gemini'
   });
   if(request.method!=='POST')return fail('Метод не поддерживается',405);
   const key=process.env.GEMINI_API_KEY;
   if(process.env.YANE_AI_PUBLIC_ENABLED==='0')return fail('ЯнеИИ временно отключён администратором.',503);
   if(!key)return fail('ЯнеИИ ещё не настроен: отсутствует GEMINI_API_KEY',503);
+  // Verify JWT with Supabase Auth on every request. Then atomically claim 60s interval in Postgres.
+  const supabaseUrl=(process.env.SUPABASE_URL||'').replace(/\/$/,'');
+  const anon=(process.env.SUPABASE_ANON_KEY||'');
+  if(!supabaseUrl||!anon)return fail('ЯнеИИ: настрой SUPABASE_URL и SUPABASE_ANON_KEY в Netlify Functions',503);
+  if(!/^https:\/\/[^\s]+$/.test(supabaseUrl))return fail('Неверный SUPABASE_URL',503);
+  const authorization=request.headers.get('authorization')||'';
+  if(!/^Bearer [A-Za-z0-9_.-]{20,}$/.test(authorization))return fail('Для ЯнеИИ войди в аккаунт',401);
+  try{
+    const check=await fetch(supabaseUrl+'/auth/v1/user',{
+      headers:{apikey:anon,Authorization:authorization},signal:AbortSignal.timeout(8000)
+    });
+    if(!check.ok)return fail('Сессия истекла. Выполни вход снова.',401);
+    const identity=await check.json();
+    if(!identity?.id)return fail('Неверная сессия',401);
+  }catch{return fail('Не удалось проверить аккаунт Supabase',503)}
 
   // An origin check adds friction for cross-site browser calls; it is NOT a complete abuse guard.
   const origin=request.headers.get('origin'),host=new URL(request.url).host;
@@ -60,12 +75,22 @@ export default async function handler(request){
   let body;try{body=JSON.parse(bodyText)}catch{return fail('Некорректный JSON')}
   if(!body||typeof body!=='object'||Array.isArray(body))return fail('Некорректный запрос');
 
-  const mode=body.mode==='video'?'video':'chat';
+  const mode='chat'; // Full video/audio upload is not yet enabled; never label frames as video analysis.
+  const language=['ru','uk','en'].includes(body.language)?body.language:'ru';
   const question=String(body.message||'').slice(0,4500);
   const frames=Array.isArray(body.frames)?body.frames.slice(0,10):[];
   if(frames.length&&(!frames.every(validFrame)||frames.reduce((n,f)=>n+f.image.length,0)>1900000))
     return fail('Неподдерживаемые или слишком большие изображения',413);
   if(!question.trim()&&!frames.length)return fail('Добавь вопрос или изображение');
+  try{
+    const claim=await fetch(supabaseUrl+'/rest/v1/rpc/v11_claim_ai',{
+      method:'POST',headers:{apikey:anon,Authorization:authorization,'content-type':'application/json'},
+      body:'{}',signal:AbortSignal.timeout(8000)
+    });
+    const val=await claim.json().catch(()=>null);
+    if(!claim.ok)return fail('Нет доступа к ЯнеИИ: '+String(val?.message||'Проверь профиль и миграции БД').slice(0,180),403);
+    if(Number(val)>0)return json({error:'Следующий вопрос через '+Math.ceil(Number(val))+' секунд',waitSeconds:Math.ceil(Number(val))},429);
+  }catch{return fail('Не удалось проверить лимит запросов',503)}
 
   const history=Array.isArray(body.history)?body.history.slice(-12)
     .filter(m=>m&&['user','assistant'].includes(m.role)&&typeof m.content==='string')
@@ -79,7 +104,7 @@ export default async function handler(request){
     parts.push({text:'Кадр на отметке '+Number(frame.time).toFixed(1)+' с:'});
     parts.push({inlineData:{mimeType:'image/jpeg',data:frame.image.slice('data:image/jpeg;base64,'.length)}});
   }
-  const model=(process.env.GEMINI_MODEL||'gemini-3.5-flash-lite').trim();
+  const model=(process.env.GEMINI_MODEL||'gemini-2.5-flash').trim();
   // Restrict model value to avoid server-side URL injection via configuration.
   if(!/^gemini-[a-zA-Z0-9.\-]+$/.test(model))return fail('Некорректное имя модели',503);
 
@@ -90,7 +115,7 @@ export default async function handler(request){
       method:'POST',signal:controller.signal,
       headers:{'content-type':'application/json','x-goog-api-key':key},
       body:JSON.stringify({
-        systemInstruction:{parts:[{text:instructions}]},
+        systemInstruction:{parts:[{text:instructions+'\nОтвет по умолчанию на языке '+({ru:'русском',uk:'украинском',en:'английском'}[language])+'. Если пользователь просит другой язык, используй его.'}]},
         contents:[...history,{role:'user',parts}],
         generationConfig:{maxOutputTokens:4096}
       })
@@ -119,7 +144,7 @@ export default async function handler(request){
   }finally{clearTimeout(timeout)}
 }
 
-// Native Netlify protection for a public AI endpoint. Per-IP, not a hard global cap.
+// Native per-IP protection is a second layer on top of Supabase per-account cooldown. Per-IP, not a hard global cap.
 // Confirm that the deploy log's post-processing phase lists the rate-limit rule.
 export const config = {
   path: '/api/yaneai',

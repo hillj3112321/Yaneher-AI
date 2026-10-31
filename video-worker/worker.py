@@ -11,6 +11,8 @@ import os
 import re
 import subprocess
 import tempfile
+import asyncio
+import httpx
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,11 @@ from PIL import Image, ImageChops, ImageStat
 
 MAX_BYTES = int(os.getenv("VIDEO_MAX_MB", "150")) * 1024 * 1024
 MAX_SECONDS = int(os.getenv("VIDEO_MAX_DURATION", "600"))
-CODE = os.getenv("VIDEO_WORKER_CODE", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+SEGMENT_SECONDS = max(30, min(int(os.getenv("VIDEO_SEGMENT_SECONDS", "120")), 240))
 ORIGINS = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "").split(",") if x.strip()]
 app = FastAPI(title="YaneCLIBB Video Worker", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["POST", "GET"], allow_headers=["Authorization", "Content-Type"])
@@ -119,17 +125,148 @@ def analyze_frames(path: str, folder: str, duration: float, step: float) -> dict
     return {"samples": readings, "events": events[:90], "representativeFrames": frames}
 
 
+
+async def authorize_and_claim(authorization: str | None) -> str:
+    """Validate Supabase JWT, ban state and 60-second cooldown, entirely server-side."""
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY or not GEMINI_API_KEY:
+        raise HTTPException(503, 'Сервер анализа видео не настроен: нужны ключи Supabase и Gemini')
+    if not authorization or not authorization.startswith('Bearer ') or len(authorization) > 5000:
+        raise HTTPException(401, 'Сначала войди в аккаунт')
+    headers={'apikey':SUPABASE_ANON_KEY,'Authorization':authorization}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            res=await client.get(SUPABASE_URL+'/auth/v1/user',headers=headers)
+            if res.status_code != 200 or not res.json().get('id'):
+                raise HTTPException(401, 'Сессия Supabase не подтверждена')
+            claim=await client.post(SUPABASE_URL+'/rest/v1/rpc/v11_claim_ai',headers=headers,json={})
+            if claim.status_code != 200:
+                raise HTTPException(403, 'Доступ к ЯнеИИ ограничен. Проверь роль или блокировку.')
+            remaining=int(claim.json())
+            if remaining>0:
+                raise HTTPException(429, f'Подожди {remaining} секунд перед следующим запросом ЯнеИИ')
+            return res.json()['id']
+        except httpx.HTTPError as ex:
+            raise HTTPException(503, 'Не удалось связаться с Supabase для проверки аккаунта') from ex
+
+async def analyze_with_gemini(path: str, mime: str, metadata: dict, cuts: list[float], audio: dict, language: str = 'ru', question: str = '') -> dict[str, Any]:
+    """Upload the entire file (including sound) to Google Files API, analyze every segment.
+
+    Gemini chooses its own internal frame sampling; scanning each actual video frame
+    is separately performed by FFmpeg get_scenes(). Claims must reflect this.
+    """
+    size=os.path.getsize(path)
+    host='https://generativelanguage.googleapis.com'
+    key_headers={'x-goog-api-key':GEMINI_API_KEY}
+    filename=None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20,read=120,write=240,pool=15),follow_redirects=False) as client:
+        try:
+            initial=await client.post(host+'/upload/v1beta/files',headers={
+                **key_headers,
+                'X-Goog-Upload-Protocol':'resumable',
+                'X-Goog-Upload-Command':'start',
+                'X-Goog-Upload-Header-Content-Length':str(size),
+                'X-Goog-Upload-Header-Content-Type':mime,
+                'Content-Type':'application/json',
+            },json={'file':{'display_name':'YaneCLIBB video analysis'}})
+            if initial.status_code not in (200,201):
+                raise HTTPException(502,'Gemini Files API: '+str(initial.status_code)+' '+initial.text[:200])
+            upload_url=initial.headers.get('X-Goog-Upload-URL','')
+            if not upload_url.startswith('https://') or not (httpx.URL(upload_url).host or '').endswith('.googleapis.com'):
+                raise HTTPException(502,'Gemini не предоставил безопасный URL для загрузки')
+            async def data_chunks():
+                with open(path,'rb') as handle:
+                    while True:
+                        block=handle.read(1024*1024)
+                        if not block: break
+                        yield block
+            uploaded=await client.post(upload_url,headers={'Content-Length':str(size),
+                'X-Goog-Upload-Offset':'0','X-Goog-Upload-Command':'upload, finalize'},content=data_chunks())
+            if uploaded.status_code not in (200,201):
+                raise HTTPException(502,'Gemini не принял видео: '+str(uploaded.status_code)+' '+uploaded.text[:200])
+            info=uploaded.json().get('file') or {}
+            filename=info.get('name')
+            uri=info.get('uri')
+            if not filename or not uri:
+                raise HTTPException(502,'Gemini не вернул имя загруженного видео')
+            for _ in range(45):
+                if str(info.get('state') or '').upper()=='ACTIVE': break
+                if str(info.get('state') or '').upper()=='FAILED':
+                    raise HTTPException(502,'Gemini не смог обработать видеофайл')
+                await asyncio.sleep(3)
+                check=await client.get(host+'/v1beta/'+filename,headers=key_headers)
+                if check.status_code!=200:
+                    raise HTTPException(502,'Gemini Files API status: '+str(check.status_code))
+                info=check.json()
+                if 'file' in info: info=info['file']
+            else:
+                raise HTTPException(504,'Gemini слишком долго обрабатывает видео')
+            duration=float(metadata['duration']);segments=[]
+            current=0.0
+            while current<duration:
+                end=min(duration,current+SEGMENT_SECONDS)
+                if end-current<0.1:break
+                relevant_cuts=[x for x in cuts if current<=x<=end][:80]
+                silences=[x for x in audio.get('silences',[]) if current<=x['start']<=end][:30]
+                lang_label={'ru':'русском','uk':'украинском','en':'английском'}.get(language,'русском')
+                prompt=(
+                 'Отвечай на '+lang_label+' языке, если пользователь явно не попросил другой. ' +
+                 'Запрос пользователя: '+question[:2000]+'\n'+
+                 'Ты эксперт по нарезкам стримов и профессиональному видеомонтажу. Получено НАСТОЯЩЕЕ '
+                 'видео со всей аудиодорожкой. Анализируй ТОЛЬКО данный временной диапазон, '
+                 f'от {current:.2f} до {end:.2f} сек (таймкоды в отчёте АБСОЛЮТНЫЕ). '
+                 'Рассмотри речь, музыкальные акценты, голос, посторонние шумы, эффекты, '
+                 'интенсивность склеек, субтитры, композицию, первый и последний кадры сегмента. '
+                 'Используй подтверждённые факты: не выдумывай речь, музыку, смысл сцен или '
+                 'ошибки, если их нельзя определить. Технические склейки FFmpeg (вероятные): '
+                 f'{relevant_cuts}. Технические интервалы тишины: {silences}. '
+                 f'Интегральная громкость: {audio.get("integratedLufs")} LUFS. '
+                 'Ответь по-русски, структурированным JSON: '
+                 '{"summary":"...","speech":"...","music":"...",'
+                 '"findings":[{"time":"00:03–00:05","category":"Звук/Монтаж/...",'
+                 '"observation":"...","recommendation":"..."}],'
+                 '"scores":{"editing":{"score":0,"reason":"..."},'
+                 '"pacing":{"score":0,"reason":"..."},'
+                 '"sound":{"score":0,"reason":"..."},'
+                 '"effects":{"score":0,"reason":"..."},'
+                 '"picture":{"score":0,"reason":"..."}}}. '
+                 'Оценка 0–10 только если есть основания; иначе score:null. '
+                 'Не утверждай, что рассмотрел каждый кадр — возможна выборка моделью.'
+                )
+                content={'contents':[{'role':'user','parts':[
+                  {'fileData':{'mimeType':mime,'fileUri':uri},
+                   'videoMetadata':{'startOffset':f'{current:.2f}s','endOffset':f'{end:.2f}s'}},
+                  {'text':prompt}]}],
+                  'generationConfig':{'maxOutputTokens':8192,'responseMimeType':'application/json'}}
+                r=await client.post(host+'/v1beta/models/'+GEMINI_MODEL+':generateContent',headers={**key_headers,'content-type':'application/json'},json=content)
+                if r.status_code!=200:
+                    raise HTTPException(502,'Gemini video segment HTTP '+str(r.status_code)+': '+r.text[:260])
+                raw='\n'.join(part.get('text','') for c in r.json().get('candidates',[])
+                              for part in c.get('content',{}).get('parts',[]) if 'text' in part)
+                try:parsed=json.loads(raw)
+                except (ValueError,TypeError):parsed={'summary':raw[:12000]}
+                segments.append({'start':round(current,2),'end':round(end,2),'analysis':parsed})
+                current=end
+            return {'segments':segments,'fullFileUploaded':True,'audioProvided':bool(metadata['hasAudio']),
+                    'segmentSeconds':SEGMENT_SECONDS}
+        except httpx.HTTPError as ex:
+            raise HTTPException(503,'Ошибка соединения с Gemini Files API: '+str(ex)[:150]) from ex
+        finally:
+            if filename and filename.startswith('files/'):
+                try:
+                    await client.delete(host+'/v1beta/'+filename,headers=key_headers,timeout=15)
+                except Exception: pass
+
 @app.get('/health')
 def health():
-    return {'status': 'ready', 'fullTimeline': True, 'audioMetadata': True}
+    return {'status':'ready','fullTimeline':True,'audioMetadata':True,'videoAndAudioAI':bool(GEMINI_API_KEY),'authRequired':True}
 
 
 @app.post('/analyze')
-async def analyze(file: UploadFile = File(...), authorization: str | None = Header(default=None)):
-    if not CODE or authorization != 'Bearer '+CODE:
-        raise HTTPException(401, 'Неверный код доступа к серверному анализу')
-    if not (file.content_type or '').startswith('video/'):
-        raise HTTPException(415, 'Нужен видеофайл')
+async def analyze(file: UploadFile = File(...), authorization: str | None = Header(default=None),
+                  question: str = Form(default=''), language: str = Form(default='ru')):
+    await authorize_and_claim(authorization)
+    if file.content_type not in ('video/mp4', 'video/webm', 'video/quicktime'):
+        raise HTTPException(415, 'Поддерживаются MP4, WebM и MOV')
     with tempfile.TemporaryDirectory(prefix='yane_worker_') as folder:
         path = str(Path(folder)/'upload.bin')
         size = 0
@@ -145,5 +282,7 @@ async def analyze(file: UploadFile = File(...), authorization: str | None = Head
         scenes = get_scenes(path)
         audio = get_audio(path,meta['hasAudio'])
         frames = analyze_frames(path,folder,meta['duration'],meta['sampleStep'])
-        return {'metadata':meta, 'sceneCuts':scenes, 'audio':audio, 'visual':frames,
-                'limitations':'Алгоритмы FFmpeg измеряют сцены, яркость и тишину, но не понимают смысл сцен и речь. Действительное удержание нельзя определить по файлу.'}
+        tech={'metadata':meta,'sceneCuts':scenes,'audio':audio,'visual':frames}
+        semantic = await analyze_with_gemini(path,file.content_type,meta,scenes,audio,language,question)
+        return {**tech,'semantic':semantic,'model':GEMINI_MODEL,
+                'limitations':'Весь файл со звуком отправлен Gemini; технический анализ FFmpeg проходит полный таймлайн. Модель может выбирать кадры внутри видео и ошибаться. Оценки не являются гарантией просмотров.'}
