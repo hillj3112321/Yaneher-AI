@@ -1,7 +1,9 @@
 /** YaneAI + Gemini API for the existing Yaneher Chat v10 frontend.
  * Deploy as netlify/functions/yaneai.mjs (replace old file).
- * Netlify environment variables: GEMINI_API_KEY, YANE_AI_ACCESS_CODE.
- * Optional: GEMINI_MODEL (default gemini-3.8-flash).
+ * Public anonymous version, no access code needed.
+ * Netlify environment variable: GEMINI_API_KEY.
+ * Optional: GEMINI_MODEL (default gemini-3.8-flash), YANE_AI_PUBLIC_ENABLED=0 to pause access.
+ * Netlify rate-limits requests to the public /api/yaneai endpoint per IP.
  * Do NOT add secrets to source control or site/config.js.
  * The website sends compressed JPEG snapshots, not full video or audio.
  */
@@ -36,16 +38,16 @@ Premiere Pro, DaVinci Resolve, видеомонтаж, звук, субтитр�
 
 export default async function handler(request){
   if(request.method==='GET')return json({
-    configured:Boolean(process.env.GEMINI_API_KEY&&process.env.YANE_AI_ACCESS_CODE),
-    mode:'server-protected',provider:'Gemini'
+    configured:Boolean(process.env.GEMINI_API_KEY&&process.env.YANE_AI_PUBLIC_ENABLED!=='0'),
+    mode:'public-rate-limited',publicAccess:true,provider:'Gemini'
   });
   if(request.method!=='POST')return fail('Метод не поддерживается',405);
   const key=process.env.GEMINI_API_KEY;
-  const secret=process.env.YANE_AI_ACCESS_CODE;
-  if(!key||!secret)return fail('ЯнеИИ ещё не настроен: нужны GEMINI_API_KEY и YANE_AI_ACCESS_CODE',503);
+  if(process.env.YANE_AI_PUBLIC_ENABLED==='0')return fail('ЯнеИИ временно отключён администратором.',503);
+  if(!key)return fail('ЯнеИИ ещё не настроен: отсутствует GEMINI_API_KEY',503);
 
   // An origin check adds friction for cross-site browser calls; it is NOT a complete abuse guard.
-  const origin=request.headers.get('origin'),host=request.headers.get('host');
+  const origin=request.headers.get('origin'),host=new URL(request.url).host;
   if(origin){
     let url;try{url=new URL(origin)}catch{return fail('Недопустимый Origin',403)}
     if(url.host!==host)return fail('Недопустимый Origin',403);
@@ -56,12 +58,11 @@ export default async function handler(request){
   try{bodyText=await request.text()}catch{return fail('Не удалось прочитать запрос')}
   if(bodyText.length>2500000)return fail('Слишком большой запрос',413);
   let body;try{body=JSON.parse(bodyText)}catch{return fail('Некорректный JSON')}
-  if(!body||typeof body!=='object')return fail('Некорректный запрос');
-  if(typeof body.accessCode!=='string'||body.accessCode!==secret)return fail('Неверный код доступа к ЯнеИИ',401);
+  if(!body||typeof body!=='object'||Array.isArray(body))return fail('Некорректный запрос');
 
   const mode=body.mode==='video'?'video':'chat';
   const question=String(body.message||'').slice(0,4500);
-  const frames=Array.isArray(body.frames)?body.frames.slice(0,18):[];
+  const frames=Array.isArray(body.frames)?body.frames.slice(0,10):[];
   if(frames.length&&(!frames.every(validFrame)||frames.reduce((n,f)=>n+f.image.length,0)>1900000))
     return fail('Неподдерживаемые или слишком большие изображения',413);
   if(!question.trim()&&!frames.length)return fail('Добавь вопрос или изображение');
@@ -109,3 +110,15 @@ export default async function handler(request){
     return fail(error.name==='AbortError'?'Время ожидания Gemini истекло':'Ошибка связи с Gemini',504);
   }finally{clearTimeout(timeout)}
 }
+
+// Native Netlify protection for a public AI endpoint. Per-IP, not a hard global cap.
+// Confirm that the deploy log's post-processing phase lists the rate-limit rule.
+export const config = {
+  path: '/api/yaneai',
+  rateLimit: {
+    action: 'rate_limit',
+    windowSize: 60,
+    windowLimit: 8,
+    aggregateBy: ['ip', 'domain']
+  }
+};
